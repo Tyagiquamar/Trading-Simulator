@@ -2,6 +2,7 @@
 #include "protocol.hpp"
 #include "engine_queue.hpp"
 #include "market_data.hpp"
+#include "net_util.hpp"
 
 #include <arpa/inet.h>
 #include <chrono>
@@ -26,31 +27,6 @@ static void handle_sigint(int) {
     std::cerr << "\n[Signal] SIGINT received. Shutting down server...\n";
 }
 
-static ssize_t safe_send(int fd, const void* buf, size_t len) {
-#ifdef MSG_NOSIGNAL
-    return send(fd, buf, len, MSG_NOSIGNAL);
-#elif defined(SO_NOSIGPIPE)
-    int one = 1; setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
-    return send(fd, buf, len, 0);
-#else
-    return send(fd, buf, len, 0);
-#endif
-}
-
-// '\n'-terminated line reader; false on EOF/error
-static bool read_line(int fd, std::string& line) {
-    line.clear();
-    char ch = 0;
-    while (true) {
-        ssize_t n = recv(fd, &ch, 1, 0);
-        if (n == 0)  return false;
-        if (n < 0)  { perror("recv"); return false; }
-        if (ch == '\n') break;
-        line.push_back(ch);
-        if (line.size() > 8192) { line.clear(); return false; }
-    }
-    return true;
-}
 
 // Engine loop: handle NEW / CANCEL / MODIFY; send TCP reply lines and UDP market‑data lines.
 static void engine_loop(OrderQueue& q, std::atomic<bool>& running,
@@ -93,21 +69,21 @@ static void engine_loop(OrderQueue& q, std::atomic<bool>& running,
             if (md && md->enabled()) md->sendLine(l);
         }
         const std::string payload = out.str();
-        (void)safe_send(m.client_fd, payload.c_str(), payload.size());
+        (void)send_all(m.client_fd, payload.c_str(), payload.size());
     }
 }
 
 static void enqueue_or_error(OrderQueue& q, const OrderMsg& msg, int client_fd) {
     if (!q.push(msg)) {
         const char* err = "ERROR Engine offline\n";
-        (void)safe_send(client_fd, err, std::strlen(err));
+        (void)send_all(client_fd, err, std::strlen(err));
     }
 }
 
 static void serve_client(int client_fd, OrderQueue& q, int64_t tick_factor) {
     std::string line;
     while (g_running) {
-        if (!read_line(client_fd, line)) { std::cout << "Client disconnected.\n"; break; }
+        if (!recv_line(client_fd, line)) { std::cout << "Client disconnected.\n"; break; }
         if (line.empty()) { std::cout << "Empty line -> close.\n"; break; }
 
         // ACK timestamp (for client RTT)
@@ -116,13 +92,13 @@ static void serve_client(int client_fd, OrderQueue& q, int64_t tick_factor) {
         {
             std::ostringstream wire; wire << "ACK " << ts_us << "\n";
             const std::string w = wire.str();
-            (void)safe_send(client_fd, w.c_str(), w.size());
+            (void)send_all(client_fd, w.c_str(), w.size());
         }
 
         if (line == "QUIT") {
             std::ostringstream bye; bye << "BYE\n";
             const std::string payload = bye.str();
-            (void)safe_send(client_fd, payload.c_str(), payload.size());
+            (void)send_all(client_fd, payload.c_str(), payload.size());
             std::cout << "Client requested QUIT.\n";
             break;
         }
@@ -138,7 +114,7 @@ static void serve_client(int client_fd, OrderQueue& q, int64_t tick_factor) {
             iss >> sideStr >> qty >> at >> price;
             if ((sideStr != "BUY" && sideStr != "SELL") || at != '@' || qty <= 0 || price <= 0.0) {
                 const char* err = "ERROR Invalid NEW. Expected: NEW BUY|SELL <qty> @ <price>\n";
-                (void)safe_send(client_fd, err, std::strlen(err));
+                (void)send_all(client_fd, err, std::strlen(err));
                 continue;
             }
             int64_t price_ticks = static_cast<int64_t>(std::llround(price * static_cast<double>(tick_factor)));
@@ -154,7 +130,7 @@ static void serve_client(int client_fd, OrderQueue& q, int64_t tick_factor) {
             int64_t id=0; iss >> id;
             if (id <= 0) {
                 const char* err = "ERROR Invalid CXL. Expected: CXL <order_id>\n";
-                (void)safe_send(client_fd, err, std::strlen(err));
+                (void)send_all(client_fd, err, std::strlen(err));
                 continue;
             }
             OrderMsg msg; msg.type = MsgType::Cancel; msg.order_id = id; msg.client_fd = client_fd;
@@ -164,7 +140,7 @@ static void serve_client(int client_fd, OrderQueue& q, int64_t tick_factor) {
             iss >> id >> new_qty >> at >> new_px;
             if (id <= 0 || new_qty <= 0 || at != '@' || new_px <= 0.0) {
                 const char* err = "ERROR Invalid MOD. Expected: MOD <order_id> <new_qty> @ <new_price>\n";
-                (void)safe_send(client_fd, err, std::strlen(err));
+                (void)send_all(client_fd, err, std::strlen(err));
                 continue;
             }
             int64_t price_ticks = static_cast<int64_t>(std::llround(new_px * static_cast<double>(tick_factor)));
@@ -173,7 +149,7 @@ static void serve_client(int client_fd, OrderQueue& q, int64_t tick_factor) {
             enqueue_or_error(q, msg, client_fd);
         } else {
             const char* err = "ERROR Unknown command. Use NEW/CXL/MOD/QUIT.\n";
-            (void)safe_send(client_fd, err, std::strlen(err));
+            (void)send_all(client_fd, err, std::strlen(err));
         }
     }
 
